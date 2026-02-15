@@ -446,21 +446,20 @@ let wf_ident loc id : (unit, string) result =
         ) loc
       else ok ()
     | Qualid _ -> assert false in
+  let check_whyml_keywords = function
+    | Id name ->
+      if List.mem name disallowed_ident_names
+      then error_out (
+          Printf.sprintf
+            "%s is a WhyML keyword and cannot be used as an identifier in source programs\n"
+            name
+        ) loc
+      else ok ()
+    | Qualid _ -> assert false in
   let* name = get_name id in
   let* () = check_prefix id in
-  if List.mem name disallowed_ident_names
-  then error_out
-      (Printf.sprintf "Identifier %s is restricted and cannot be \
-                       used in source programs."
-         (string_of_ident id))
-      loc
-  else if matches_generated_pattern name
-  then error_out
-      (Printf.sprintf "Identifier %s is reserved for code generation \
-                       and cannot be used in source programs."
-         (string_of_ident id))
-      loc
-  else ok ()
+  let* () = check_whyml_keywords id in
+  ok ()
 
 let wf_ident_opt loc id : (unit, string) result =
   match id with

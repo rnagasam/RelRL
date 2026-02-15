@@ -76,6 +76,8 @@ let translate_program fmt penv ctbl =
     Format.pp_print_newline fmt ();
     Format.print_flush () in
   let ctxt, state_module = Translate.Build_State.mk (penv,ctbl) in
+  (* Initialize collision registry with all user-defined identifiers from the program *)
+  Collision_registry.init_with_penv ctxt.collision_reg penv;
   let mlw_files = compile_penv ctxt penv in
   emit_mlw state_module;
   (* Why3.Mlw_printer.pp_mlw_file Format.std_formatter (Why3.Ptree.mlw_file_of_sexp (Sexplib.Sexp.load_sexp "sexp.txt")); *)

@@ -11,6 +11,7 @@ open Why3
 open Why3constants
 open Why3util
 open Build_operators
+open Collision_registry
 
 
 let trans_debug = ref false
@@ -32,6 +33,7 @@ let gen_frame_lemma = ref true
       ``klass_f''.
 *)
 
+
 let maybe_underscore_with fn name =
   match name with
   | Id cname -> fn cname
@@ -46,22 +48,46 @@ let capitalize_and_maybe_underscore =
 let lowercase_and_maybe_underscore =
   maybe_underscore_with String.lowercase_ascii
 
-let mk_reftype_ctor cname : Ptree.ident =
-  mk_ident @@ capitalize_and_maybe_underscore cname
+(* Safe versions that use collision detection *)
+let mk_reftype_ctor registry cname : Ptree.ident =
+  let base = if String.length cname > 0 && Char.uppercase_ascii cname.[0] = cname.[0]
+             then cname else String.capitalize_ascii cname in
+  let fresh = Collision_registry.mk_fresh_ident registry base in
+  mk_ident fresh
 
-let mk_field_str cname field_name : string =
-  let cname = lowercase_and_maybe_underscore cname in
-  cname ^ "_" ^ unqualify_ident field_name
+let mk_field_ident registry cname field_name : Ptree.ident =
+  let cname_lower = String.lowercase_ascii cname in
+  let base = cname_lower ^ "_" ^ field_name.Ptree.id_str in
+  let fresh = Collision_registry.mk_fresh_ident registry base in
+  mk_ident fresh
 
-let mk_field_ident cname field_name : Ptree.ident =
-  mk_ident @@ mk_field_str cname field_name
+let mk_ctor_name registry cname : Ptree.ident =
+  let cap_name = if String.length cname > 0 && Char.uppercase_ascii cname.[0] = cname.[0]
+                 then cname else String.capitalize_ascii cname in
+  let base = "init_" ^ cap_name in
+  let fresh = Collision_registry.mk_fresh_ident registry base in
+  mk_ident fresh
 
-let mk_ctor_name cname : Ptree.ident =
-  mk_ident @@ "init_" ^ capitalize_and_maybe_underscore cname
+let mk_alloc_name registry cname : Ptree.ident =
+  let cap_name = if String.length cname > 0 && Char.uppercase_ascii cname.[0] = cname.[0]
+                 then cname else String.capitalize_ascii cname in
+  let base = "mk_" ^ cap_name in
+  let fresh = Collision_registry.mk_fresh_ident registry base in
+  mk_ident fresh
 
-let mk_alloc_name cname : Ptree.ident =
-  let name = mk_reftype_ctor cname in
-  mk_ident @@ "mk_" ^ name.id_str
+(* Simplified versions without collision detection for internal helpers *)
+let mk_reftype_ctor_simple cname : Ptree.ident =
+  let base = if String.length cname > 0 && Char.uppercase_ascii cname.[0] = cname.[0]
+             then cname else String.capitalize_ascii cname in
+  mk_ident base
+
+let mk_image_fn_ident_simple fname : Ptree.ident =
+  mk_ident ("img_" ^ fname.Ptree.id_str)
+
+(* Helper to extract string from classname ident *)
+let classname_str (cn : T.ident) : string = T.id_name cn
+
+
 
 let id_name id : string = T.id_name id
 
@@ -110,6 +136,9 @@ type ctxt = {
 
   (* Map from names of fields and globals to names of setters in Why3 *)
   setter_map: Ptree.ident M.t;
+
+  collision_reg: collision_registry;
+
 }
 
 (* FIXME: inst_map may not be required anymore since we also have meth_wrs. *)
@@ -130,6 +159,7 @@ let ini_ctxt =
     meth_wrs = QualidM.empty;
     current_mdl = None;
     setter_map = M.empty;
+    collision_reg = Collision_registry.create ();
   }
 
 type bipred_info =
@@ -214,8 +244,9 @@ let merge_ctxt c c' =
   let meth_wrs = QualidM.union merge_fn c.meth_wrs c'.meth_wrs in
   let setter_map = M.union merge_fn c.setter_map c'.setter_map in
   let current_mdl = c.current_mdl in
+  let collision_reg = c.collision_reg in
   {ctbl; ident_map; field_map; extty_map; inst_map;
-   meth_wrs; current_mdl; setter_map}
+   meth_wrs; current_mdl; setter_map; collision_reg}
 
 let merge_bi_ctxt c c' =
   let merge_fn _ s _ = Some s in
@@ -310,13 +341,17 @@ let reset_fresh_id, mk_fresh_id =
   let stamp = ref 0 in
   (fun () -> stamp := 0), (fun str -> incr stamp; str ^ string_of_int !stamp)
 
+(* Safe identifier generation using collision registry *)
+let mk_fresh_ident_safe registry base : string =
+  Collision_registry.mk_fresh_ident registry base
+
 let gen_ident state ctxt name : Ptree.ident =
   let open M in
   let state_id = (ident_of_qualid state).Ptree.id_str in
   let rec loop name : Ptree.ident =
     let name' = Id name in
     if mem name' ctxt.ident_map || mem name' ctxt.field_map || name = state_id
-    then loop (mk_fresh_id name)
+    then loop (mk_fresh_ident_safe ctxt.collision_reg name)
     else mk_ident name in
   loop name
 
@@ -334,7 +369,7 @@ let gen_ident2 bi_ctxt name : Ptree.ident =
     || mem name' bi_ctxt.bimethods
     || QualidM.mem (qualid_of_ident (mk_ident name)) bi_ctxt.bipreds
     || name = lstate || name = rstate || name = refperm
-    then loop (mk_fresh_id name)
+    then loop (mk_fresh_ident_safe bi_ctxt.left_ctxt.collision_reg name)
     else mk_ident name in
   loop name
 
@@ -350,7 +385,7 @@ let fresh_name ctxt name : string =
   let rec loop name : Ptree.ident =
     let name' = Id name in
     if M.mem name' ctxt.ident_map || M.mem name' ctxt.field_map
-    then loop (mk_fresh_id name)
+    then loop (mk_fresh_ident_safe ctxt.collision_reg name)
     else mk_ident name in
   (loop name).id_str
 
@@ -474,20 +509,20 @@ let st_load_old ctxt s (y, f) : Ptree.term =
 let st_has_type s r k : Ptree.term =
   let alloc_type_map = mk_qvar (s %. st_alloct_field) in
   let find_typeof_r  = map_find_fn <*> [alloc_type_map; r] in
-  let class_type = ~* (mk_reftype_ctor k) in
+  let class_type = ~* (mk_reftype_ctor_simple k) in
   find_typeof_r ==. class_type
 
 (* st_add_type s r k = ``add r (mk_reftype_ctor k) s.alloct'' *)
 let st_add_type ctxt s r k : Ptree.term =
   let r = lookup_id_term ctxt s r in
   let alloct_map = mk_qvar (s %. st_alloct_field) in
-  let class_type = ~* (mk_reftype_ctor k) in
+  let class_type = ~* (mk_reftype_ctor ctxt.collision_reg (classname_str k)) in
   map_add_fn <*> [r; class_type; alloct_map]
 
 let st_old_has_type s r k : Ptree.term =
   let alloct_map    = mk_old_term (mk_qvar (s %. st_alloct_field)) in
   let find_typeof_r = map_find_fn <*> [alloct_map; r] in
-  let class_type = ~* (mk_reftype_ctor k) in
+  let class_type = ~* (mk_reftype_ctor_simple k) in
   find_typeof_r ==. class_type
 
 (* st_previously_unalloc'd = ``not (mem r (old s.alloct))'' *)
@@ -547,21 +582,26 @@ let st_store_array ?msg ctxt s a idx v =
 *)
 (* -------------------------------------------------------------------------- *)
 
-let mk_image_fn_ident (fname: Ptree.ident) : Ptree.ident =
-  mk_ident ("img_" ^ fname.id_str)
+
+
+let mk_image_fn_ident registry fname : Ptree.ident =
+  let base = "img_" ^ fname.Ptree.id_str in
+  let fresh = Collision_registry.mk_fresh_ident registry base in
+  mk_ident fresh
+
 
 let mk_image_fn_qualid fname : Ptree.qualid =
-  qualid_of_ident @@ mk_image_fn_ident fname
+  qualid_of_ident @@ mk_image_fn_ident_simple fname
 
 let mk_image_fn fname : Ptree.decl =
-  let image_fn_name = mk_image_fn_ident fname in
+  let image_fn_name = mk_image_fn_ident_simple fname in
   let image_fn_ty : Ptree.pty =
     PTarrow (state_type, PTarrow (rgn_type, rgn_type)) in
   let image_fn = mk_ldecl image_fn_name [] image_fn_ty None in
   Dlogic [image_fn]
 
 let mk_image_axiom_name f : Ptree.ident =
-  let img_fn = mk_image_fn_ident f in
+  let img_fn = mk_image_fn_ident_simple f in
   mk_ident @@ img_fn.id_str ^ "_ax"
 
 let rec mk_image_axiom ctxt decl_class f (fty: ity) : Ptree.decl =
@@ -601,7 +641,7 @@ and mk_image_axiom_aux ctxt decl_class f (fty: ity) : Ptree.decl =
       let state_qid = qualid_of_ident state in
       let qalloc = map_mem_fn <*> [~* q; mk_qvar(state_qid%.st_alloct_field)] in
       let qty = map_find_fn <*> [mk_qvar(state_qid%.st_alloct_field); ~* q] in
-      let qty = qty ==. (~* (mk_reftype_ctor decl_class)) in
+      let qty = qty ==. (~* (mk_reftype_ctor ctxt.collision_reg decl_class)) in
       let qmem = mem_fn <*> [~* q; ~* rgn] in
       let qval = map_find_fn <*> [mk_qvar(state_qid%.f); ~* q] in
       let pqrel =
@@ -636,7 +676,7 @@ and mk_image_axiom_array_slots ctxt decl_class f fty
       let+? arr, _ = bindvar (~. (fresh_name ctxt "arr"), reference_type) in
       let alloc'd = map_mem_fn <*> [~*arr; mk_qvar(st %. st_alloct_field)] in
       let arr_ty = map_find_fn <*> [mk_qvar(st %. st_alloct_field); ~*arr] in
-      let arr_ty = arr_ty ==. (~* (mk_reftype_ctor decl_class)) in
+      let arr_ty = arr_ty ==. (~* (mk_reftype_ctor ctxt.collision_reg decl_class)) in
       let arr_mem = mem_fn <*> [~*arr; ~*rgn] in
       let arr_val = map_find_fn <*> [mk_qvar(st%.f); ~*arr] in
       let arr_len = array_len_fn <*> [arr_val] in
@@ -657,7 +697,7 @@ and mk_image_axiom_array_slots ctxt decl_class f fty
          let p_null = (~*p) ==. null_const_term in
          let p_alloc'd = map_mem_fn <*> [~*p; mk_qvar(st %. st_alloct_field)] in
          let p_ty_get = map_find_fn <*> [mk_qvar(st %. st_alloct_field); ~*p] in
-         let p_ty_eq = p_ty_get ==. (~* (mk_reftype_ctor k)) in
+         let p_ty_eq = p_ty_get ==. (~* (mk_reftype_ctor ctxt.collision_reg (T.id_name k))) in
          p_null ^|| (p_alloc'd ^&& p_ty_eq) in
       return (pmem_img <==> (p_cond ^&& (build_term inner_term)))
     | Tmath (_, Some Trgn) ->
@@ -699,7 +739,7 @@ module Build_State = struct
   let mk_reftype ctbl : Ptree.type_def =
     let mk_ctor name = (Loc.dummy_position, name, []) in
     let class_names = Ctbl.known_class_names ctbl in
-    let ctors = map mk_reftype_ctor class_names in
+    let ctors = map (fun cname -> mk_reftype_ctor_simple (T.id_name cname)) class_names in
     if length class_names = 0 then TDrecord []
     else TDalgebraic (map mk_ctor (ctors))
 
@@ -872,7 +912,7 @@ module Build_State = struct
     let p_has_type_k =
       let alloc_map = mk_var st_alloct_field in
       let type_of_p = map_find_fn <*> [alloc_map; p] in
-      let class_typ = mk_var (mk_reftype_ctor cdecl.class_name) in
+      let class_typ = mk_var (mk_reftype_ctor ctxt.collision_reg (T.id_name cdecl.class_name)) in
       type_of_p ==. class_typ in
     p_has_type_k ^==> inner
 
@@ -922,7 +962,7 @@ module Build_State = struct
           let cell_null = (~*cell_id) ==. null_const_term in
           let cell_alloc'd = map_mem_fn <*> [~*cell_id; alloct] in
           let cell_typ = map_find_fn <*> [alloct; ~*cell_id] in
-          let cell_typ_eq = cell_typ ==. (mk_var (mk_reftype_ctor cls)) in
+          let cell_typ_eq = cell_typ ==. (mk_var (mk_reftype_ctor ctxt.collision_reg (classname_str cls))) in
           let cond = cell_null ^|| (cell_alloc'd ^&& cell_typ_eq) in
           let bind_cell_term = mk_term (Tlet (cell_id, cell_val, cond)) in
           return (i_ge_0 ^==> i_lt_len ^==> bind_cell_term)
@@ -937,7 +977,7 @@ module Build_State = struct
     let field_map = mk_qvar (qualid_of_ident fld) in
     let field_val = map_find_fn <*> [field_map; p] in
     let fval_null = field_val ==. null_const_term in
-    let cls_rtype = mk_var (mk_reftype_ctor cls) in
+    let cls_rtype = mk_var (mk_reftype_ctor_simple (classname_str cls)) in
     let alloc_map = mk_var st_alloct_field in
     let alloc'd   = map_mem_fn <*> [field_val; alloc_map] in
     let fval_type = (map_find_fn <*> [alloc_map; field_val]) ==. cls_rtype in
@@ -1138,7 +1178,7 @@ module Build_State = struct
     let p_is_null = p ==. null_const_term in
     let p_alloc'd = map_mem_fn <*> [p; alloc_map] in
     let p_typ = map_find_fn <*> [alloc_map; p] in
-    let p_class_typ = p_typ ==. (~* (mk_reftype_ctor cdecl.class_name)) in
+    let p_class_typ = p_typ ==. (~* (mk_reftype_ctor ctxt.collision_reg (T.id_name cdecl.class_name))) in
     p_is_null ^|| (p_alloc'd ^&& p_class_typ)
 
   let is_allocated_pred = mk_qualid ["isAllocated"]
@@ -1175,7 +1215,7 @@ module Build_State = struct
   let rec mk_new_classes ctxt ctbl : ctxt * Ptree.decl list =
     let classes = Ctbl.known_class_names ctbl in
     List.fold_right (fun cname (ctxt, decls) ->
-        let name = mk_alloc_name cname in
+        let name = mk_alloc_name ctxt.collision_reg (classname_str cname) in
         let wrs, decl = mk_new_class ctxt ctbl cname name in
         (* FIXME: Here, we associate each ctor method K with mk_K.
            However, it should be associated with init_K.
@@ -1205,7 +1245,7 @@ module Build_State = struct
         let add_to_ofld = map_add_fn <*> [result_term; value; old_fld] in
         let equiv_flds = wrttn_fld ==. add_to_ofld in
         wrttn_fld, [mk_ensures equiv_flds] in
-    let cname_ctor = mk_reftype_ctor cname in
+    let cname_ctor = mk_reftype_ctor ctxt.collision_reg (classname_str cname) in
     let field_names = Ctbl.field_names ctbl ~classname:cname in
     let state_ident = ~. (fresh_name ctxt "s") in
     let state = qualid_of_ident state_ident in
@@ -1383,7 +1423,7 @@ module Build_State = struct
         let ctxt = add_logic_ident ctxt (Id "p") p.id_str in
         let p_alloc'd = map_mem_fn <*> [~*p; prealloc] in
         let p_not_in_rgn = mk_term (Tnot (mem_fn <*> [~*p; ~*rgn_id])) in
-        let p_of_type = st_has_type spost (~*p) decl_class in
+        let p_of_type = st_has_type spost (~*p) (classname_str decl_class) in
         let p_loc = (Id p_name.id_str -: Tclass decl_class,fname -: field_ty) in
         let p_preval = st_load_term ctxt spre p_loc in
         let p_postval = st_load_term ctxt spost p_loc in
@@ -1569,7 +1609,7 @@ module Build_State = struct
           | _ -> (Id "") in
         match Ctbl.field_type ctxt.ctbl ~field:f with
         | Some ty ->
-          let img_ax = mk_image_axiom ctxt decl_class f' ty in
+          let img_ax = mk_image_axiom ctxt (classname_str decl_class) f' ty in
           [img_fn; img_ax] @ decls
         | None -> decls
       ) ctxt.field_map [] in
@@ -1775,7 +1815,7 @@ let rec interp_exp (interp: 'a exp_interpretation) ctxt state (e: T.exp T.t)
     interp.mk_app image_fn [interp.mk_var state; g]
   | Esubrgn (g, k) ->
     let g = interp_exp interp ctxt state g in
-    let k = interp.mk_var (qualid_of_ident (mk_reftype_ctor k)) in
+    let k = interp.mk_var (qualid_of_ident (mk_reftype_ctor ctxt.collision_reg (classname_str k))) in
     let alloct = interp.mk_var (state %. st_alloct_field) in
     interp.mk_app rgnsubK_fn [g; alloct; k]
   | Ecall (fn, args) ->
@@ -1895,7 +1935,8 @@ and mk_reftype_list ts : Ptree.term =
   let rec mklist = function
     | [] -> mk_qvar list_nil
     | t :: ts ->
-      let t = mk_var (mk_reftype_ctor t) in
+      let t_str = T.id_name t in
+      let t = mk_var (mk_reftype_ctor_simple t_str) in
       list_cons_fn <*> [t; mklist ts] in
   mklist ts
 
@@ -1993,7 +2034,7 @@ let rec expr_of_atomic_command ctxt state (ac: T.atomic_command) : Ptree.expr =
     let e = mk_abstract_expr [] (pty_of_ty x.ty) empty_spec in
     update_id ~msg ctxt state x.node e
   | New_class (id, k) ->
-    let fn   = mk_alloc_name k in
+    let fn   = mk_alloc_name ctxt.collision_reg (T.id_name k) in
     let call = mk_eapp (qualid_of_ident fn) [mk_qevar state] in
     update_id ~msg ctxt state id.node call
   | New_array (a, k, len) -> compile_new_array msg ctxt state a k len
@@ -2038,7 +2079,7 @@ and compile_new_array msg ctxt state a k len =
     fst (Option.get (Ctbl.array_like_slots_field ctxt.ctbl ~classname:k)) in
   let elt_ty = Option.get (Ctbl.element_type ctxt.ctbl ~classname:k) in
   let len_expr  = expr_of_exp ctxt state len in
-  let mk_array  = mk_alloc_name k in
+  let mk_array  = mk_alloc_name ctxt.collision_reg (classname_str k) in
   let alloc_obj = mk_eapp (qualid_of_ident mk_array) [mk_qevar state] in
   let array_val = mk_eapp array_make_fn [len_expr; default_value ctxt elt_ty] in
   let e1 = update_id ~msg ctxt state a.node alloc_obj in
@@ -2198,14 +2239,18 @@ and simplify_writes ctxt (eff: T.effect) : T.effect =
    for each p in ps such that p is of a non-null type, generate the
    appropriate formula.  Requires ps to be well-formed in the sense
    that only class types are annotated as non-null. *)
-let rec params_of_param_info_list ?(prefix="") state ps
+let rec params_of_param_info_list ?(prefix="") ?(ctxt=None) state ps
   : Ptree.param list * Ptree.term list =
   let open T in
   let open Lib.Option.Monad_syntax in
   let loop param (params, obligations) =
     let {param_name; param_ty; is_non_null} = param in
     let param_name = id_name param_name.node in
-    let name = mk_ident (prefix ^ param_name) in
+    let name = 
+      match ctxt with
+      | Some c -> gen_ident state c (prefix ^ param_name)
+      | None -> mk_ident (prefix ^ param_name) 
+    in
     let pty = pty_of_ty param_ty in
     let param = mk_param name false pty in
     match param_ty with
@@ -2345,7 +2390,7 @@ let compile_meth_aux ctxt (m: T.meth_decl) : meth_compile_info =
   let meth_name =
     let name = m.meth_name.node in
     if Ctbl.class_exists ctxt.ctbl ~classname:name
-    then mk_ctor_name name
+    then mk_ctor_name ctxt.collision_reg (classname_str name)
     else mk_ident @@ id_name name in
   let ret_ty = pty_of_ty m.result_ty in
   let result = Id_other, mk_qualid ["result"] in
@@ -2683,7 +2728,7 @@ let rec compile_interface mlw_map ctxt intr : mlw_map =
       let ctxt, decl = compile_meth_def ctxt mdef in
       let meth_name =
         if Ctbl.class_exists ctxt.ctbl ~classname:mdecl.meth_name.node
-        then mk_ctor_name mdecl.meth_name.node
+        then mk_ctor_name ctxt.collision_reg (classname_str mdecl.meth_name.node)
         else mk_ident (id_name mdecl.meth_name.node) in
       let ident_map =
         M.add mdecl.meth_name.node (Id_other, mk_qualid [meth_name.id_str])
@@ -2872,7 +2917,7 @@ and compile_module_elt mlw_map ctxt mdl_name elt
     let Method (mdecl, com) = mdef in
     let meth_name =
       if Ctbl.class_exists ctxt.ctbl ~classname:mdecl.meth_name.node
-      then mk_ctor_name mdecl.meth_name.node
+      then mk_ctor_name ctxt.collision_reg (classname_str mdecl.meth_name.node)
       else mk_ident (id_name mdecl.meth_name.node) in
     (* NOTE: Cannot use add_ident here because of how constructors
        are handled.  If used in a New_class command, the name K is
@@ -3654,17 +3699,11 @@ let rec compile_bimethod bi_ctxt bimethod : bi_ctxt * Ptree.decl =
   let open T in
   let Bimethod (bimdecl, ccopt) = bimethod in
 
-  let add_params prefix ctxt params =
-    foldr (fun pinfo ctxt ->
-        let id = pinfo.param_name.node in
-        add_ident Id_other ctxt id (prefix ^ id_name id)
-      ) ctxt params in
-
   let meth_name =
     let name = bimdecl.bimeth_name in
     if Ctbl.class_exists bi_ctxt.left_ctxt.ctbl ~classname:name
     && Ctbl.class_exists bi_ctxt.right_ctxt.ctbl ~classname:name
-    then mk_ctor_name name
+    then mk_ctor_name bi_ctxt.left_ctxt.collision_reg (classname_str name)
     else mk_ident (id_name name) in
 
   let lret_ty, rret_ty = map_pair pty_of_ty bimdecl.result_ty in
@@ -3683,16 +3722,27 @@ let rec compile_bimethod bi_ctxt bimethod : bi_ctxt * Ptree.decl =
   let refperm = qualid_of_ident refperm_id in
   let bi_ctxt = {bi_ctxt with refperm} in
   let lps, rps = bimdecl.bimeth_left_params, bimdecl.bimeth_right_params in
-  let lparams, lext = params_of_param_info_list ~prefix:"l_" left_state lps in
-  let rparams, rext = params_of_param_info_list ~prefix:"r_" right_state rps in
+  let lparams, lext = params_of_param_info_list ~prefix:"l_" ~ctxt:(Some bi_ctxt.left_ctxt) left_state lps in
+  let rparams, rext = params_of_param_info_list ~prefix:"r_" ~ctxt:(Some bi_ctxt.right_ctxt) right_state rps in
   let extra_pre = lext @ rext in
   let extra_pre = begin
     let left_globs = globals_type_precond bi_ctxt.left_ctxt left_state in
     let right_globs = globals_type_precond bi_ctxt.right_ctxt right_state in
     left_globs @ right_globs
   end @ extra_pre in
-  let left_ctxt  = add_params "l_" bi_ctxt.left_ctxt lps in
-  let right_ctxt = add_params "r_" bi_ctxt.right_ctxt rps in
+  (* Update context using actual generated parameter names, not reconstructed ones *)
+  let left_ctxt = List.fold_left2 (fun ctxt orig_pinfo generated_param ->
+      let orig_id = orig_pinfo.T.param_name.node in
+      let (_, Some id_opt, _, _) = generated_param in
+      let actual_name = id_opt.Ptree.id_str in
+      add_ident Id_other ctxt orig_id actual_name
+    ) bi_ctxt.left_ctxt lps lparams in
+  let right_ctxt = List.fold_left2 (fun ctxt orig_pinfo generated_param ->
+      let orig_id = orig_pinfo.T.param_name.node in
+      let (_, Some id_opt, _, _) = generated_param in
+      let actual_name = id_opt.Ptree.id_str in
+      add_ident Id_other ctxt orig_id actual_name
+    ) bi_ctxt.right_ctxt rps rparams in
   let bi_ctxt = {bi_ctxt with left_ctxt; right_ctxt} in
 
   let bispec =
@@ -3763,7 +3813,7 @@ let rec compile_bimethod bi_ctxt bimethod : bi_ctxt * Ptree.decl =
     let rctxt = add_local_ident rres_ity bi_ctxt.right_ctxt result rres in
 
     let bi_ctxt = {bi_ctxt with left_ctxt=lctxt; right_ctxt=rctxt} in
-    let com_ctx = build_bimethod_ctx bi_ctxt (lps, rps) in
+    let com_ctx = build_bimethod_ctx bi_ctxt (lparams, rparams) (lps, rps) in
     let body_uc = com_ctx cc in
 
     let lval = default_value bi_ctxt.left_ctxt lres_ity in
@@ -3804,13 +3854,9 @@ let rec compile_bimethod bi_ctxt bimethod : bi_ctxt * Ptree.decl =
 
     bi_ctxt, Dlet (meth_name, false, Expr.RKnone, fundef)
 
-and build_bimethod_ctx bi_ctxt (lparams, rparams) cc =
+and build_bimethod_ctx bi_ctxt (gen_lparams, gen_rparams) (lparams, rparams) cc =
   let open T in
   let lstate, rstate = bi_ctxt.left_state, bi_ctxt.right_state in
-
-  let param_name = function
-    | `L p -> id_name (left_var p.param_name.node)
-    | `R p -> id_name (right_var p.param_name.node) in
 
   let rec add_to_expr cc fin : Ptree.expr =
     match cc.Ptree.expr_desc with
@@ -3820,32 +3866,46 @@ and build_bimethod_ctx bi_ctxt (lparams, rparams) cc =
       mk_expr (Esequence (e1, add_to_expr e2 fin))
     | _ -> mk_expr (Esequence (cc, fin)) in
 
-  let rec aux bi_ctxt = function
-    | [] ->
+  (* Pair up original params with generated params to extract actual names *)
+  let lpairs = List.combine lparams gen_lparams in
+  let rpairs = List.combine rparams gen_rparams in
+
+  let rec aux bi_ctxt lpairs rpairs =
+    match lpairs, rpairs with
+    | [], [] ->
       (* lres should be l_result and rres should be r_result *)
       let lres = lookup_id bi_ctxt.left_ctxt lstate (Id "result") in
       let rres = lookup_id bi_ctxt.right_ctxt rstate (Id "result") in
       let ret = mk_expr (Etuple [lres; rres]) in
       add_to_expr (compile_bicommand bi_ctxt cc) ret
-    | p :: ps ->
-      let name = mk_ident (param_name p) in
-      let copy = mk_expr (Eapply (mk_expr Eref, mk_evar name)) in
-      let bi_ctxt = match p with
-        | `L p ->
-          let ctxt = bi_ctxt.left_ctxt in
-          let p_ity = p.param_ty in
-          let ctxt = add_local_ident p_ity ctxt p.param_name.node name.id_str in
-          {bi_ctxt with left_ctxt = ctxt}
-        | `R p ->
-          let ctxt = bi_ctxt.right_ctxt in
-          let p_ity = p.param_ty in
-          let ctxt = add_local_ident p_ity ctxt p.param_name.node name.id_str in
-          {bi_ctxt with right_ctxt = ctxt} in
-      mk_expr (Elet (name, false, Expr.RKnone, copy, aux bi_ctxt ps)) in
+    | (p, gen_param) :: lps, rps ->
+      let (_, id_opt, _, _) = gen_param in
+      let actual_gen_name = match id_opt with
+        | Some id -> id.Ptree.id_str
+        | None -> failwith "Generated parameter missing name" in
+      let name = mk_ident actual_gen_name in
+      let copy = mk_expr (Eapply (mk_expr Eref, mk_evar (mk_ident actual_gen_name))) in
+      let ctxt = bi_ctxt.left_ctxt in
+      let p_ity = p.param_ty in
+      let ctxt = add_local_ident p_ity ctxt p.param_name.node actual_gen_name in
+      let bi_ctxt = {bi_ctxt with left_ctxt = ctxt} in
+      mk_expr (Elet (name, false, Expr.RKnone, copy, aux bi_ctxt lps rps))
+    | lps, (p, gen_param) :: rps ->
+      let (_, id_opt, _, _) = gen_param in
+      let actual_gen_name = match id_opt with
+        | Some id -> id.Ptree.id_str
+        | None -> failwith "Generated parameter missing name" in
+      let name = mk_ident actual_gen_name in
+      let copy = mk_expr (Eapply (mk_expr Eref, mk_evar (mk_ident actual_gen_name))) in
+      let ctxt = bi_ctxt.right_ctxt in
+      let p_ity = p.param_ty in
+      let ctxt = add_local_ident p_ity ctxt p.param_name.node actual_gen_name in
+      let bi_ctxt = {bi_ctxt with right_ctxt = ctxt} in
+      mk_expr (Elet (name, false, Expr.RKnone, copy, aux bi_ctxt lps rps))
+    | [], _::_ | _::_, [] -> 
+      failwith "Mismatched parameter lists in build_bimethod_ctx" in
 
-  let lparams = map (fun e -> `L e) lparams in
-  let rparams = map (fun e -> `R e) rparams in
-  aux bi_ctxt (lparams @ rparams)
+  aux bi_ctxt lpairs rpairs
 
 
 (* -------------------------------------------------------------------------- *)
