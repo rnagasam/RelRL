@@ -397,19 +397,29 @@ let rec simplify_term (t: Ptree.term) : Ptree.term =
     let t2' = simplify_term t2 in
     begin match op, t1'.term_desc, t2'.term_desc with
       | Dterm.DTand, Ttrue, t  | Dterm.DTand, t, Ttrue -> mk_term t
-      | Dterm.DTand, Tfalse, t | Dterm.DTand, t, Tfalse -> mk_term Tfalse
-      | Dterm.DTor, Ttrue, t   | Dterm.DTor, t, Ttrue -> mk_term Ttrue
+      | Dterm.DTand, Tfalse, _ | Dterm.DTand, _, Tfalse -> mk_term Tfalse
+      | Dterm.DTor, Ttrue, _   | Dterm.DTor, _, Ttrue -> mk_term Ttrue
       | Dterm.DTor, Tfalse, t  | Dterm.DTor, t, Tfalse -> mk_term t
+      | Dterm.DTimplies, Tfalse, _ -> mk_term Ttrue
+      | Dterm.DTimplies, Ttrue, t -> mk_term t
+      | Dterm.DTimplies, _, Ttrue -> mk_term Ttrue
+      | Dterm.DTiff, Ttrue, t | Dterm.DTiff, t, Ttrue -> mk_term t
+      | Dterm.DTiff, Tfalse, t | Dterm.DTiff, t, Tfalse -> mk_term (Tnot (mk_term t))
       | _, _, _ -> mk_term (Tbinop (t1', op, t2'))
-    end    
+    end
   | Tbinnop (t1, op, t2) ->
     let t1' = simplify_term t1 in
     let t2' = simplify_term t2 in
     begin match op, t1'.term_desc, t2'.term_desc with
       | Dterm.DTand, Ttrue, t  | Dterm.DTand, t, Ttrue -> mk_term t
-      | Dterm.DTand, Tfalse, t | Dterm.DTand, t, Tfalse -> mk_term Tfalse
-      | Dterm.DTor, Ttrue, t   | Dterm.DTor, t, Ttrue -> mk_term Ttrue
+      | Dterm.DTand, Tfalse, _ | Dterm.DTand, _, Tfalse -> mk_term Tfalse
+      | Dterm.DTor, Ttrue, _   | Dterm.DTor, _, Ttrue -> mk_term Ttrue
       | Dterm.DTor, Tfalse, t  | Dterm.DTor, t, Tfalse -> mk_term t
+      | Dterm.DTimplies, Tfalse, _ -> mk_term Ttrue
+      | Dterm.DTimplies, Ttrue, t -> mk_term t
+      | Dterm.DTimplies, _, Ttrue -> mk_term Ttrue
+      | Dterm.DTiff, Ttrue, t | Dterm.DTiff, t, Ttrue -> mk_term t
+      | Dterm.DTiff, Tfalse, t | Dterm.DTiff, t, Tfalse -> mk_term (Tnot (mk_term t))
       | _, _, _ -> mk_term (Tbinnop (t1', op, t2'))
     end
   | Tnot t ->
@@ -478,9 +488,38 @@ let subst_term (s: (Ptree.qualid * Ptree.term) list) (t: Ptree.term) =
       (* subst s (forall x. p) =
            let x' = refresh x in
            (forall x'. subst ((x,x') :: s) p) *)
-      
-      failwith "HERE"
-    | _ -> failwith "not implemented" in
+      let new_s =
+        let old_names = List.filter_map (fun n ->
+            Option.map qualid_of_ident n) names in
+        let new_terms = List.filter_map (fun b ->
+            Option.map mk_term b) bnds' in
+        List.combine old_names new_terms @ s in
+      let new_bnds = map refresh_binder bnds in
+      mk_term (Tquant (q, new_bnds, trigs, aux new_s tm))
+    | Tlet (x, v, body) ->
+      let x' = refresh_ident x in
+      let v' = aux s v in
+      let s' = (qualid_of_ident x, mk_term (mk_id x')) :: s in
+      mk_term (Tlet (x', v', aux s' body))
+    | Tat (t, label) -> mk_term (Tat (aux s t, label))
+    | Tattr (attr, t) -> mk_term (Tattr (attr, aux s t))
+    | Tcast (t, pty) -> mk_term (Tcast (aux s t, pty))
+    | Ttuple ts -> mk_term (Ttuple (map (aux s) ts))
+    | Tnot t -> mk_term (Tnot (aux s t))
+    | Trecord fields ->
+      mk_term (Trecord (map (fun (q, t) -> (q, aux s t)) fields))
+    | Tupdate (t, fields) ->
+      mk_term (Tupdate (aux s t, map (fun (q, t) -> (q, aux s t)) fields))
+    | Tscope (q, t) -> mk_term (Tscope (q, aux s t))
+    | Tcase (t, branches) ->
+      (* Note: does not rename pattern-bound variables *)
+      mk_term (Tcase (aux s t,
+        map (fun (p, t) -> (p, aux s t)) branches))
+    | Teps (id, pty, t) ->
+      let id' = refresh_ident id in
+      let s' = (qualid_of_ident id, mk_term (mk_id id')) :: s in
+      mk_term (Teps (id', pty, aux s' t))
+    | _ -> warn_unsupported trm; trm in
   aux s t
 
 let elim_let (trm: Ptree.term) : Ptree.term =
@@ -515,15 +554,36 @@ let elim_let (trm: Ptree.term) : Ptree.term =
     | Teps (id, ty, t) -> warn_unsupported trm; ret (Teps (id, ty, aux subs t))
     | Tattr (attr, t) -> ret (Tattr (attr, aux subs t))
     | Tlet (id, e, tm) ->
-      failwith "WORKING HERE"
-    | Tquant (q, bs, triggers, tm) -> failwith "WORKING HERE"
-    | Tcase (tm, pats) -> failwith "WORKING HERE"
-    | Trecord rs -> failwith "WORKING HERE"
-    | Tupdate (t, upds) -> failwith "WORKING HERE"
-    | Tscope (q, tm) -> failwith "WORKING HERE"
-    | Tat (tm, i) -> failwith "WORKING HERE"
+      let e' = aux subs e in
+      (* Substitute the let-bound variable with its definition *)
+      let id_qualid = Qident id in
+      let subs' = (id_qualid, e') :: subs in
+      aux subs' tm
+    | Tquant (q, bs, triggers, tm) ->
+      (* Rename bound variables to avoid capture *)
+      let rename_binder (loc, name, gho, ty) =
+        match name with
+        | Some n ->
+          tag := !tag + 1;
+          let n' = {n with id_str = refresh_name n.id_str} in
+          let sub = (Qident n, ret (Tident (Qident n'))) in
+          (loc, Some n', gho, ty), Some sub
+        | None -> (loc, None, gho, ty), None in
+      let bs', new_subs = List.split (map rename_binder bs) in
+      let new_subs = List.filter_map (fun x -> x) new_subs in
+      let subs' = new_subs @ subs in
+      ret (Tquant (q, bs', triggers, aux subs' tm))
+    | Tcase (tm, pats) ->
+      ret (Tcase (aux subs tm,
+        map (fun (p, t) -> (p, aux subs t)) pats))
+    | Trecord rs ->
+      ret (Trecord (map (fun (q, t) -> (q, aux subs t)) rs))
+    | Tupdate (t, upds) ->
+      ret (Tupdate (aux subs t, map (fun (q, t) -> (q, aux subs t)) upds))
+    | Tscope (q, tm) -> ret (Tscope (q, aux subs tm))
+    | Tat (tm, i) -> ret (Tat (aux subs tm, i))
     | Ttuple ts -> ret (Ttuple (map (aux subs) ts))
-    | Tcast (tm, ty) -> failwith "WORKING HERE" in
+    | Tcast (tm, ty) -> ret (Tcast (aux subs tm, ty)) in
 
   aux [] trm
 

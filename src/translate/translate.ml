@@ -2841,7 +2841,7 @@ let rec compile_module mlw_map ctxt mdl : mlw_map =
         match M.find intr_name mlw_map with
         | Compiled (Unary ctxt, _) -> mlw_map, qualify_ctxt ctxt intr_str
         | _ | exception Not_found -> assert false in
-      let ctxt, decls, mlw_map = foldr (fun elt (ctxt, decls, mlw_map) ->
+      let ctxt, decls, mlw_map = foldl (fun elt (ctxt, decls, mlw_map) ->
           let new_ctxt, decl, mlw =
             compile_module_elt mlw_map ctxt mdl_qualid elt in
           match decl with
@@ -3226,9 +3226,7 @@ and mk_biwr_frame_condition ctxt state ?(alloc_cond=false) effects side
     if not (exists wr_to_alloc writes) && not alloc_cond then []
     else [alloc_does_not_shrink state] in
   let mk_frame_cond eff = mk_wr_frame_condition ctxt state [eff] in
-  (* [Oct-5-2022] mk_wr_frame_condition already generates alloc_cond?? *)
-  ignore alloc_cond;
-  (* alloc_cond @ *) concat_map mk_frame_cond writes
+  alloc_cond @ concat_map mk_frame_cond writes
 
 
 let rec compile_bicommand bi_ctxt (cc: T.bicommand) : Ptree.expr =
